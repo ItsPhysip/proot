@@ -13,10 +13,17 @@ linked where they exist.
 | 2026-09-10 | link2symlink: never lose the file when no intermediate name is free; refuse with EMLINK, roll back partial moves, report real errnos | `src/extension/link2symlink/link2symlink.c`, `tests/test-5c2e7a91.sh` | termux/proot#394 (tn-py) |
 | 2026-09-10 | link2symlink: raise the intermediate suffix limit to 9999 | `src/extension/link2symlink/link2symlink.c` | termux/proot#394 (tn-py) |
 | 2026-09-27 | syscall: translate fchmodat2 (452): it reached the kernel untranslated, so guest paths failed and host-only paths were acted on | `src/syscall/sysnums*.{list,h}`, `src/syscall/enter.c`, `src/syscall/seccomp.c`, `src/extension/fake_id0/fake_id0.c` | ULS |
+| 2026-09-28 | syscall: an empty path with AT_FDCWD and AT_EMPTY_PATH (fstatat, statx, fchownat, fchmodat2, utimensat, faccessat2, linkat, name_to_handle_at) acted on proot's *host* launch directory, because proot emulates the guest cwd; it is now translated as "." against the guest cwd. statx's exit handler no longer turns it into EBADF | `src/syscall/enter.c`, `src/tracee/statx.c` | ULS |
+| 2026-09-28 | syscall: translate open_tree (428), which reached the kernel untranslated and returned fds on host paths (`/system`); the fd-based mount API (move_mount, fspick, mount_setattr, open_tree_attr, open_tree with OPEN_TREE_CLONE) returns ENOSYS so callers fall back to the emulated mount(2) | `src/syscall/sysnums*`, `src/syscall/enter.c`, `src/syscall/seccomp.c` | ULS |
+| 2026-09-28 | syscall: translate AF_UNIX pathname destinations of sendto, sendmsg (msghdr copied, never written in place) and sendmmsg; they reached the kernel untranslated (host objects reachable, guest paths ENOENT) | `src/syscall/socket.{c,h}`, `src/syscall/enter.c`, `src/syscall/seccomp.c` | ULS |
+| 2026-09-28 | fake_id0: chroot() replaced the name-space by freeing tracee->fs while its binding lists' destructor still needed it, aborting proot ("binding.c:438: Type mismatch"); the bindings are now replaced in place, and checked against the guest path | `src/extension/fake_id0/chroot.c`, `tests/test-897815a0.sh` | ULS |
+| 2026-09-28 | sysnum: `translate_sysnum()` read one entry past the syscall table (`>` instead of `>=`) | `src/syscall/sysnum.c` | ULS |
 
 Base: termux/proot `d4d2a19`.
 
 ## Verification
+
+- 2026-09-28 fixes (empty path at AT_FDCWD, open_tree, send* destinations, chroot, sysnum bound): each shown on the S26 Ultra, without shims, against the previous release: host launch-dir/`/system`/canary objects were acted on or opened before, and are not after; chroot no longer aborts. The ULS device suite passes with the shims under `-0` and `-0 -l`.
 
 - fchmodat2, run raw on the S26 Ultra with no shims: a guest path is changed (it was ENOENT before), `/system` gives ENOENT (it was EROFS from the host's /system), and a no-follow symlink gives ENOTSUP, as the kernel does.
 
