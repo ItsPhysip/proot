@@ -87,6 +87,9 @@
 #ifndef CLONE_NEWCGROUP
 #define CLONE_NEWCGROUP 0x02000000
 #endif
+#ifndef OPEN_TREE_CLONE
+#define OPEN_TREE_CLONE 1
+#endif
 
 #define CLONE_NS_MASK (CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | \
 		       CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET | \
@@ -2495,6 +2498,51 @@ int translate_syscall_enter(Tracee *tracee)
 		poke_reg(tracee, SYSARG_RESULT, 0);
 		set_sysnum(tracee, PR_void);
 		status = 0;
+		break;
+
+	/* The file-descriptor based mount API has no such emulation.
+	 * Letting it reach the kernel would either fail (no
+	 * CAP_SYS_ADMIN) or, when PRoot runs as root, really mount
+	 * behind the bindings' back.  Report it as missing, like
+	 * pre-5.2 kernels do: callers such as libmount then fall back
+	 * to mount(2), emulated above.  A cloned tree (OPEN_TREE_CLONE)
+	 * is only good for move_mount(2), so it goes the same way; a
+	 * plain open_tree(2) is an O_PATH open and is translated.  */
+	case PR_move_mount:
+	case PR_fspick:
+	case PR_mount_setattr:
+	case PR_open_tree_attr:
+		status = -ENOSYS;
+		break;
+
+	case PR_open_tree:
+		/* int open_tree(int dirfd, const char *pathname, unsigned int flags) */
+		dirfd = peek_reg(tracee, CURRENT, SYSARG_1);
+		flags = peek_reg(tracee, CURRENT, SYSARG_3);
+
+		if ((flags & OPEN_TREE_CLONE) != 0) {
+			status = -ENOSYS;
+			break;
+		}
+
+		status = get_sysarg_path(tracee, path, SYSARG_2);
+		if (status < 0)
+			break;
+
+		/* An empty path with AT_EMPTY_PATH names @dirfd itself;
+		 * for AT_FDCWD the kernel would use the tracee's real
+		 * working directory, which PRoot never changes, instead of
+		 * the guest one.  */
+		if (   path[0] == '\0'
+		    && dirfd == AT_FDCWD
+		    && (flags & AT_EMPTY_PATH) != 0
+		    && peek_reg(tracee, CURRENT, SYSARG_2) != 0)
+			strcpy(path, ".");
+
+		if ((flags & AT_SYMLINK_NOFOLLOW) != 0)
+			status = translate_path2(tracee, dirfd, path, SYSARG_2, SYMLINK);
+		else
+			status = translate_path2(tracee, dirfd, path, SYSARG_2, REGULAR);
 		break;
 
 	case PR_open:
