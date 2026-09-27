@@ -28,10 +28,13 @@
 #include <sys/socket.h>  /* struct sockaddr_un, AF_UNIX, */
 #include <sys/un.h>      /* struct sockaddr_un, */
 #include <sys/param.h>   /* MIN(), MAX(), */
+#include <stdbool.h>     /* bool, */
+#include <talloc.h>      /* talloc_*, */
 
 #include "syscall/socket.h"
 #include "tracee/tracee.h"
 #include "tracee/mem.h"
+#include "tracee/abi.h"
 #include "path/binding.h"
 #include "path/temp.h"
 #include "path/path.h"
@@ -88,10 +91,13 @@ static int read_sockaddr_un(Tracee *tracee, struct sockaddr_un *sockaddr, word_t
  * in the @tracee memory at the given @address.  See the documentation
  * of read_sockaddr_un() for the meaning of the @size parameter.
  * Also, the new address of the translated sockaddr_un is put in the
- * @address parameter.  This function returns -errno if an error
- * occurred, otherwise 0.
+ * @address parameter.  A translated path too long to fit the sun_path
+ * array is bound to a shorter one if @bind_long_path is true, it is
+ * refused with -ENAMETOOLONG otherwise.  This function returns -errno
+ * if an error occurred, 0 if there was nothing to translate,
+ * otherwise 1.
  */
-int translate_socketcall_enter(Tracee *tracee, word_t *address, int size)
+int translate_socketcall_enter2(Tracee *tracee, word_t *address, int size, bool bind_long_path)
 {
 	struct sockaddr_un sockaddr;
 	char user_path[PATH_MAX];
@@ -113,6 +119,9 @@ int translate_socketcall_enter(Tracee *tracee, word_t *address, int size)
 	if (strlen(host_path) > sizeof_path) {
 		char *shorter_host_path;
 		Binding *binding;
+
+		if (!bind_long_path)
+			return -ENAMETOOLONG;
 
 		/* The translated path is too long to fit the sun_path
 		 * array, so let's bind it to a shorter path.  */
@@ -152,6 +161,124 @@ int translate_socketcall_enter(Tracee *tracee, word_t *address, int size)
 		return -EFAULT;
 
 	status = write_data(tracee, *address, &sockaddr, sizeof(sockaddr));
+	if (status < 0)
+		return status;
+
+	return 1;
+}
+
+/**
+ * c.f. function above, a too long path is bound to a shorter one.
+ */
+int translate_socketcall_enter(Tracee *tracee, word_t *address, int size)
+{
+	return translate_socketcall_enter2(tracee, address, size, true);
+}
+
+/* A struct msghdr is seven words long, msg_name and then msg_namelen
+ * first, on all ABIs.  */
+#define SIZEOF_MSGHDR(tracee)	(7 * sizeof_word(tracee))
+
+/**
+ * Translate the pathname of the struct sockaddr_un pointed to by the
+ * msg_name field of the struct msghdr currently stored in the @tracee
+ * memory at the given @address, and put the address of the translated
+ * sockaddr_un in @name.  This function returns -errno if an error
+ * occurred, 0 if there was nothing to translate, otherwise 1.
+ */
+static int translate_msg_name(Tracee *tracee, word_t address, word_t *name)
+{
+	int namelen;
+
+	*name = peek_word(tracee, address);
+	if (errno != 0)
+		return -errno;
+
+	/* Nothing to do if no address was specified, as for a
+	 * connected socket.  */
+	if (*name == 0)
+		return 0;
+
+	namelen = peek_int32(tracee, address + sizeof_word(tracee));
+	if (errno != 0)
+		return -errno;
+
+	/* See PR_sendto in translate_syscall_enter().  */
+	return translate_socketcall_enter2(tracee, name, namelen, false);
+}
+
+/**
+ * Make the struct msghdr currently stored in the @tracee memory at
+ * the given @address point to the translated sockaddr_un at @name.
+ * This function returns -errno if an error occurred, otherwise 0.
+ */
+static int set_msg_name(Tracee *tracee, word_t address, word_t name)
+{
+	poke_word(tracee, address, name);
+	if (errno != 0)
+		return -errno;
+
+	poke_int32(tracee, address + sizeof_word(tracee), sizeof(struct sockaddr_un));
+	if (errno != 0)
+		return -errno;
+
+	return 0;
+}
+
+/**
+ * Push a copy of the @size bytes currently stored in the @tracee
+ * memory at the given @address to a newly allocated space, and put
+ * the address of this copy in the @address parameter.  This function
+ * returns -errno if an error occurred, otherwise 0.
+ */
+static int copy_to_new_mem(Tracee *tracee, word_t *address, size_t size)
+{
+	void *data;
+	int status;
+
+	data = talloc_size(tracee->ctx, size);
+	if (data == NULL)
+		return -ENOMEM;
+
+	status = read_data(tracee, data, *address, size);
+	if (status < 0)
+		return status;
+
+	*address = alloc_mem(tracee, size);
+	if (*address == 0)
+		return -EFAULT;
+
+	return write_data(tracee, *address, data, size);
+}
+
+/**
+ * Translate the pathname of the struct sockaddr_un pointed to by the
+ * msg_name field of the struct msghdr currently stored in the @tracee
+ * memory at the given @address: sendmsg(2) sends to it as sendto(2)
+ * sends to its destination address.  The tracee might use its struct
+ * msghdr again, so it is left untouched: a copy of it that points to
+ * the translated sockaddr_un is pushed to a newly allocated space,
+ * whose address is put in the @address parameter.  This function
+ * returns -errno if an error occurred, 0 if there was nothing to
+ * translate, otherwise 1.
+ */
+int translate_msghdr_enter(Tracee *tracee, word_t *address)
+{
+	word_t name;
+	int status;
+
+	if (*address == 0)
+		return 0;
+
+	status = translate_msg_name(tracee, *address, &name);
+	if (status <= 0)
+		return status;
+
+	status = copy_to_new_mem(tracee, address, SIZEOF_MSGHDR(tracee));
+	if (status < 0)
+		return status;
+
+	status = set_msg_name(tracee, *address, name);
 	if (status < 0)
 		return status;
 

@@ -2129,6 +2129,8 @@ int translate_syscall_enter(Tracee *tracee)
 		int fd = peek_reg(tracee, CURRENT, SYSARG_1);
 		word_t buf = peek_reg(tracee, CURRENT, SYSARG_2);
 		word_t len = peek_reg(tracee, CURRENT, SYSARG_3);
+		word_t address;
+		word_t size;
 		struct fake_netlink_socket *sock = fake_netlink_socket(tracee, fd);
 
 		if (sock != NULL) {
@@ -2140,6 +2142,21 @@ int translate_syscall_enter(Tracee *tracee)
 			break;
 		}
 		note_netns_netlink_request(tracee, fd, buf, len);
+
+		/* The destination address, if any, can be a named Unix
+		 * domain socket, as for connect(2).  Unlike bind(2), the
+		 * socket has to exist already: a path too long for
+		 * sun_path can't be bound to a shorter one.  */
+		address = peek_reg(tracee, CURRENT, SYSARG_5);
+		size    = peek_reg(tracee, CURRENT, SYSARG_6);
+
+		status = translate_socketcall_enter2(tracee, &address, size, false);
+		if (status <= 0)
+			break;
+
+		poke_reg(tracee, SYSARG_5, address);
+		poke_reg(tracee, SYSARG_6, sizeof(struct sockaddr_un));
+
 		status = 0;
 		break;
 	}
@@ -2174,6 +2191,14 @@ int translate_syscall_enter(Tracee *tracee)
 		if (   is_netns_netlink_fd(tracee, fd)
 		    && msghdr_first_iovec(tracee, msghdr_addr, &base, &len))
 			note_netns_netlink_request(tracee, fd, base, len);
+
+		/* See PR_sendto above, msg_name is its destination.  */
+		status = translate_msghdr_enter(tracee, &msghdr_addr);
+		if (status <= 0)
+			break;
+
+		poke_reg(tracee, SYSARG_2, msghdr_addr);
+
 		status = 0;
 		break;
 	}
