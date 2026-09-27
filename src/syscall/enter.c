@@ -2517,6 +2517,7 @@ int translate_syscall_enter(Tracee *tracee)
 		break;
 
 	case PR_fchownat:
+	case PR_fchmodat2:
 	case PR_fstatat64:
 	case PR_newfstatat:
 	case PR_utimensat:

@@ -321,6 +321,7 @@ static FilteredSysnum filtered_sysnums[] = {
 	{ PR_execve,		FILTER_SYSEXIT },
 	{ PR_fchmod,		FILTER_SYSEXIT },
 	{ PR_fchmodat,		FILTER_SYSEXIT },
+	{ PR_fchmodat2,		FILTER_SYSEXIT },
 	{ PR_fchown,		FILTER_SYSEXIT },
 	{ PR_fchown32,		FILTER_SYSEXIT },
 	{ PR_fchownat,		FILTER_SYSEXIT },
@@ -446,6 +447,7 @@ static void override_permissions(const Tracee *tracee, const char *path, bool is
 			break;
 
 		case PR_fchmodat:
+		case PR_fchmodat2:
 			node->mode = peek_reg(tracee, ORIGINAL, SYSARG_3);
 			break;
 
@@ -641,7 +643,9 @@ static int handle_sysenter_end(Tracee *tracee, Config *config)
 		return handle_chmod_enter_end(tracee, IGNORE_SYSARG, SYSARG_2, 
 			SYSARG_1, IGNORE_SYSARG, config);
 	/* int fchmodat(int dirfd, const char *pathname, mode_t mode, int flags (unused)) */
+	/* int fchmodat2(int dirfd, const char *pathname, mode_t mode, int flags) */
 	case PR_fchmodat:
+	case PR_fchmodat2:
 		return handle_chmod_enter_end(tracee, SYSARG_2, SYSARG_3, 
 			IGNORE_SYSARG, SYSARG_1, config);
 
@@ -1035,6 +1039,7 @@ static int handle_sysexit_end(Tracee *tracee, Config *config)
 	case PR_fchown32:
 	case PR_lchown32:
 	case PR_fchmodat:
+	case PR_fchmodat2:
 	case PR_fchownat: 
 		return handle_perm_err_exit_end(tracee, config, false);
 
