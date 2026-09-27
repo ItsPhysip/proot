@@ -74,9 +74,9 @@ int handle_chroot_exit_end(Tracee *tracee, Config *config, bool from_sigsys) {
 	/* Fetch guest path if we didn't already.  */
 	if (!from_sigsys) {
 		input = peek_reg(tracee, ORIGINAL, SYSARG_1);
-		status = read_path(tracee, path, input);
+		status = read_path(tracee, path_guest, input);
 		if (status < 0)
-			return -errno;
+			return status;
 	}
 
 	/* Check if chroot target has bind mounts inside.
