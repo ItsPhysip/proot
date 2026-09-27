@@ -16,6 +16,7 @@ int handle_chroot_exit_end(Tracee *tracee, Config *config, bool from_sigsys) {
 	word_t result;
 	struct stat statbuf;
 	bool seen_bind_under_new_root = false;
+	char *cwd;
 
 	if (config->euid != 0) /* TODO: && !HAS_CAP(SYS_CHROOT) */
 		return from_sigsys ? -EPERM : 0;
@@ -100,19 +101,33 @@ int handle_chroot_exit_end(Tracee *tracee, Config *config, bool from_sigsys) {
 		if (status < 0)
 			return status;
 
-		/* Replace tracee bindings */
-		talloc_unlink(tracee, tracee->fs);
-		tracee->fs = talloc_zero(tracee, FileSystemNameSpace);
+		/* Replace tracee bindings, in place: tracee->fs may be
+		 * shared with other tracees (CLONE_FS), and the
+		 * destructor of the binding lists, remove_bindings(),
+		 * finds their tracee through the talloc parent of
+		 * tracee->fs, so the lists have to be released while
+		 * tracee->fs is still attached.  */
 		binding = new_binding(tracee, path_host_absolute, "/", true);
+		if (binding == NULL) {
+			TALLOC_FREE(tracee->fs->bindings.pending);
+			return -ENOMEM;
+		}
+
+		talloc_unlink(tracee->fs, tracee->fs->bindings.guest);
+		tracee->fs->bindings.guest = NULL;
+		talloc_unlink(tracee->fs, tracee->fs->bindings.host);
+		tracee->fs->bindings.host = NULL;
+
 		initialize_bindings(tracee);
 
 		/* Restore current dir.  */
 		status = detranslate_path(tracee, path, NULL);
-		if (status <= 0) {
-			tracee->fs->cwd = talloc_strdup(tracee->fs, "/");
-		} else {
-			tracee->fs->cwd = talloc_strdup(tracee->fs, path);
-		}
+		cwd = talloc_strdup(tracee->fs, status <= 0 ? "/" : path);
+		if (cwd == NULL)
+			return -ENOMEM;
+		TALLOC_FREE(tracee->fs->cwd);
+		tracee->fs->cwd = cwd;
+		talloc_set_name_const(tracee->fs->cwd, "$cwd");
 
 		/* Force success.  */
 		if (from_sigsys) return 1;
