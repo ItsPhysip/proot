@@ -28,6 +28,8 @@
 #include <sys/socket.h>  /* struct sockaddr_un, AF_UNIX, */
 #include <sys/un.h>      /* struct sockaddr_un, */
 #include <sys/param.h>   /* MIN(), MAX(), */
+#include <sys/uio.h>     /* UIO_MAXIOV, */
+#include <stdint.h>      /* uint32_t, */
 #include <stdbool.h>     /* bool, */
 #include <talloc.h>      /* talloc_*, */
 
@@ -176,8 +178,10 @@ int translate_socketcall_enter(Tracee *tracee, word_t *address, int size)
 }
 
 /* A struct msghdr is seven words long, msg_name and then msg_namelen
- * first, on all ABIs.  */
+ * first, and a struct mmsghdr is a struct msghdr followed by msg_len,
+ * eight words long, on all ABIs.  */
 #define SIZEOF_MSGHDR(tracee)	(7 * sizeof_word(tracee))
+#define SIZEOF_MMSGHDR(tracee)	(8 * sizeof_word(tracee))
 
 /**
  * Translate the pathname of the struct sockaddr_un pointed to by the
@@ -283,6 +287,103 @@ int translate_msghdr_enter(Tracee *tracee, word_t *address)
 		return status;
 
 	return 1;
+}
+
+/**
+ * Translate the msg_name of each of the *@vlen struct mmsghdr
+ * currently stored in the @tracee memory at the given @address, since
+ * sendmmsg(2) sends each of these messages as sendmsg(2) does.  As
+ * with translate_msghdr_enter(), a copy of this vector is used when
+ * any name is translated, and its address is put in the @address
+ * parameter; the kernel then reports the length it sent of each
+ * message in this copy, see translate_mmsghdr_exit().  Like the
+ * kernel, send only the messages before the first one whose name
+ * can't be read or translated: *@vlen is lowered to their number, or
+ * the error is returned if there is none.  This function returns
+ * -errno if an error occurred, 0 if there was nothing to change,
+ * otherwise 1.
+ */
+int translate_mmsghdr_enter(Tracee *tracee, word_t *address, word_t *vlen)
+{
+	bool translated = false;
+	word_t *names;
+	word_t count;
+	word_t i;
+	int status = 0;
+
+	if (*address == 0 || *vlen == 0)
+		return 0;
+
+	/* The kernel doesn't send more messages at once.  */
+	count = MIN(*vlen, UIO_MAXIOV);
+
+	names = talloc_zero_array(tracee->ctx, word_t, count);
+	if (names == NULL)
+		return -ENOMEM;
+
+	for (i = 0; i < count; i++) {
+		status = translate_msg_name(tracee, *address + i * SIZEOF_MMSGHDR(tracee), &names[i]);
+		if (status < 0)
+			break;
+
+		if (status > 0)
+			translated = true;
+		else
+			names[i] = 0;
+	}
+
+	if (status < 0) {
+		if (i == 0)
+			return status;
+
+		count = i;
+		*vlen = count;
+	}
+	else if (!translated)
+		return 0;
+
+	if (translated) {
+		status = copy_to_new_mem(tracee, address, count * SIZEOF_MMSGHDR(tracee));
+		if (status < 0)
+			return status;
+
+		for (i = 0; i < count; i++) {
+			if (names[i] == 0)
+				continue;
+
+			status = set_msg_name(tracee, *address + i * SIZEOF_MMSGHDR(tracee), names[i]);
+			if (status < 0)
+				return status;
+		}
+	}
+
+	return 1;
+}
+
+/**
+ * Report the msg_len the kernel wrote in the copy at @copy of the
+ * vector of struct mmsghdr stored in the @tracee memory at the given
+ * @address, for its first @count messages, the ones it sent; see
+ * translate_mmsghdr_enter().  This function returns -errno if an
+ * error occurred, otherwise 0.
+ */
+int translate_mmsghdr_exit(Tracee *tracee, word_t address, word_t copy, word_t count)
+{
+	const word_t offsetof_len = SIZEOF_MSGHDR(tracee);
+	uint32_t len;
+	word_t i;
+
+	for (i = 0; i < count; i++) {
+		len = peek_uint32(tracee, copy + i * SIZEOF_MMSGHDR(tracee) + offsetof_len);
+		if (errno != 0)
+			return -errno;
+
+		poke_uint32(tracee, address + i * SIZEOF_MMSGHDR(tracee) + offsetof_len, len);
+		if (errno != 0)
+			return -errno;
+	}
+
+	return 0;
 }
 
 /**

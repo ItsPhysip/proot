@@ -2181,6 +2181,30 @@ int translate_syscall_enter(Tracee *tracee)
 		break;
 	}
 
+	case PR_sendmmsg: {
+		word_t vector = peek_reg(tracee, CURRENT, SYSARG_2);
+		word_t vlen   = (unsigned int) peek_reg(tracee, CURRENT, SYSARG_3);
+
+		/* See PR_sendmsg above, for each message.  */
+		status = translate_mmsghdr_enter(tracee, &vector, &vlen);
+		if (status <= 0)
+			break;
+
+		poke_reg(tracee, SYSARG_3, vlen);
+
+		/* The kernel writes the length it sent of each message
+		 * in the copy of the vector: the exit stage reports
+		 * these to the tracee's own vector.  */
+		if (vector != peek_reg(tracee, CURRENT, SYSARG_2)) {
+			poke_reg(tracee, SYSARG_2, vector);
+			tracee->sysexit_pending = true;
+			tracee->restart_how = PTRACE_SYSCALL;
+		}
+
+		status = 0;
+		break;
+	}
+
 	case PR_recvfrom: {
 		int fd = peek_reg(tracee, CURRENT, SYSARG_1);
 		struct fake_netlink_socket *sock = fake_netlink_socket(tracee, fd);
