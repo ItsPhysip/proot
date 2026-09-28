@@ -160,6 +160,18 @@ typedef struct tracee {
 	int netlink_ack_fd;
 	uint32_t netlink_ack_seq;
 
+	/* Source address of the recvfrom(2) / recvmsg(2) in progress:
+	 * where the tracee wants it (addr), where its length goes
+	 * (size_addr) and the length the tracee allowed (max_size), so
+	 * the exit stage can detranslate a host AF_UNIX path (see
+	 * translate_recv_name_exit).  */
+	struct {
+		bool pending;
+		word_t addr;
+		word_t size_addr;
+		word_t max_size;
+	} recv_name;
+
 	/* Support for ptrace emulation (tracer side).  */
 	struct {
 		size_t nb_ptracees;

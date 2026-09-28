@@ -208,6 +208,19 @@ void translate_syscall_exit(Tracee *tracee)
 			status = 1;
 			break;
 
+		case SYS_RECVFROM:
+		case SYS_RECVMSG:
+			/* See case PR_recvfrom.  */
+			if (tracee->recv_name.pending) {
+				tracee->recv_name.pending = false;
+				if ((int) syscall_result >= 0)
+					(void) translate_recv_name_exit(tracee,
+							tracee->recv_name.addr,
+							tracee->recv_name.size_addr,
+							tracee->recv_name.max_size);
+			}
+			goto end;
+
 		case SYS_BIND:
 		case SYS_CONNECT:
 			/* Restore the initial parameters: this memory was
@@ -805,6 +818,18 @@ void translate_syscall_exit(Tracee *tracee)
 
 	case PR_recvfrom:
 	case PR_recvmsg:
+		/* Report a named AF_UNIX sender with its guest path.  The
+		 * message is received anyway: keep the syscall result,
+		 * whatever happens here.  */
+		if (tracee->recv_name.pending) {
+			tracee->recv_name.pending = false;
+			if ((int) syscall_result >= 0)
+				(void) translate_recv_name_exit(tracee,
+						tracee->recv_name.addr,
+						tracee->recv_name.size_addr,
+						tracee->recv_name.max_size);
+		}
+
 		/* Turn the kernel's refusal to reconfigure a network
 		 * namespace the tracee doesn't really have into an ack.  */
 		handle_netlink_reply_exit(tracee, syscall_number);
