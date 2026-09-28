@@ -2021,7 +2021,7 @@ int translate_syscall_enter(Tracee *tracee)
 		address = peek_reg(tracee, CURRENT, SYSARG_2);
 		size    = peek_reg(tracee, CURRENT, SYSARG_3);
 
-		status = translate_socketcall_enter(tracee, &address, size);
+		status = translate_socketcall_enter(tracee, &address, size, syscall_number == PR_bind);
 		if (status <= 0)
 			break;
 
@@ -2144,13 +2144,11 @@ int translate_syscall_enter(Tracee *tracee)
 		note_netns_netlink_request(tracee, fd, buf, len);
 
 		/* The destination address, if any, can be a named Unix
-		 * domain socket, as for connect(2).  Unlike bind(2), the
-		 * socket has to exist already: a path too long for
-		 * sun_path can't be bound to a shorter one.  */
+		 * domain socket, as for connect(2).  */
 		address = peek_reg(tracee, CURRENT, SYSARG_5);
 		size    = peek_reg(tracee, CURRENT, SYSARG_6);
 
-		status = translate_socketcall_enter2(tracee, &address, size, false);
+		status = translate_socketcall_enter(tracee, &address, size, false);
 		if (status <= 0)
 			break;
 
@@ -2424,7 +2422,8 @@ int translate_syscall_enter(Tracee *tracee)
 		size      = PEEK_WORD(SYSARG_ADDR(3), 0);
 
 		sock_addr_saved = sock_addr;
-		status = translate_socketcall_enter(tracee, &sock_addr, size);
+		status = translate_socketcall_enter(tracee, &sock_addr, size,
+						peek_reg(tracee, CURRENT, SYSARG_1) == SYS_BIND);
 		if (status <= 0)
 			break;
 

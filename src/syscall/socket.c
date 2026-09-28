@@ -30,6 +30,7 @@
 #include <sys/param.h>   /* MIN(), MAX(), */
 #include <sys/uio.h>     /* UIO_MAXIOV, */
 #include <stdint.h>      /* uint32_t, */
+#include <unistd.h>      /* readlink(2), */
 #include <stdbool.h>     /* bool, */
 #include <talloc.h>      /* talloc_*, */
 
@@ -49,6 +50,10 @@
 static const off_t offsetof_path = offsetof(struct sockaddr_un, sun_path);
 extern struct sockaddr_un sockaddr_un__;
 static const size_t sizeof_path  = sizeof(sockaddr_un__.sun_path);
+
+/* Prefix of the temporary links made for socket paths too long for
+ * sun_path, see translate_socketcall_enter().  */
+#define SOCKET_LINK_PREFIX "sock"
 
 /**
  * Copy in @sockaddr the struct sockaddr_un stored in the @tracee
@@ -89,17 +94,119 @@ static int read_sockaddr_un(Tracee *tracee, struct sockaddr_un *sockaddr, word_t
 }
 
 /**
+ * Remove the socket file @path.  Note: this is a talloc destructor.
+ */
+static int remove_socket_file(char *path)
+{
+	(void) unlink(path);
+	return 0;
+}
+
+/**
+ * Make @host_path, a socket path too long for sun_path, reachable by
+ * connect(2), sendto(2) and sendmsg(2) through a short temporary
+ * symbolic link: the kernel follows it to the socket.  The link is
+ * removed once tracee->ctx is freed, that is, at the next event of
+ * this tracee, after the syscall ran.  This function returns -errno
+ * if an error occurred, otherwise 0.
+ */
+static int shorten_path(Tracee *tracee, char host_path[PATH_MAX])
+{
+	const char *link;
+
+	link = create_temp_symlink(tracee->ctx, SOCKET_LINK_PREFIX, host_path);
+	if (link == NULL)
+		return -EINVAL;
+
+	if (strlen(link) > sizeof_path)
+		return -ENAMETOOLONG;
+
+	strcpy(host_path, link);
+	return 0;
+}
+
+/**
+ * Make @host_path, a socket path too long for sun_path, usable by
+ * bind(2).  The kernel doesn't follow a symbolic link in the last
+ * component here, since bind(2) creates it, but it does in the
+ * directories: point a short link at the parent directory and use
+ * "link/name", so the socket is created at its real place.  The link
+ * lives until PRoot exits because the kernel keeps this name for
+ * getsockname(2) and friends, see resolve_socket_link().
+ *
+ * If even "link/name" is too long, the guest path is bound to a short
+ * temporary path for the rest of this tracee's life instead; the
+ * socket then lives in the temporary directory and is removed with
+ * the binding.  This function
+ * returns -errno if an error occurred, otherwise 0.
+ */
+static int shorten_bind_path(Tracee *tracee, char host_path[PATH_MAX])
+{
+	char guest_path[PATH_MAX];
+	char *shorter_path;
+	const char *link;
+	Binding *binding;
+	char *name;
+	int length;
+	int status;
+
+	name = strrchr(host_path, '/');
+	if (name == NULL || name == host_path || name[1] == '\0')
+		return -ENAMETOOLONG;
+
+	*name = '\0';
+	link = create_temp_symlink(NULL, SOCKET_LINK_PREFIX, host_path);
+	*name = '/';
+	if (link == NULL)
+		return -EINVAL;
+
+	if (strlen(link) + strlen(name) <= sizeof_path) {
+		length = snprintf(guest_path, sizeof(guest_path), "%s%s", link, name);
+		if (length < 0 || (size_t) length >= sizeof(guest_path))
+			return -ENAMETOOLONG;
+		strcpy(host_path, guest_path);
+		return 0;
+	}
+	talloc_free((void *) link);
+
+	/* Ensure the guest path of this new binding is
+	 * canonicalized, as it is always assumed.  */
+	strcpy(guest_path, host_path);
+	status = detranslate_path(tracee, guest_path, NULL);
+	if (status < 0)
+		return -EINVAL;
+
+	shorter_path = create_temp_name(tracee->life_context, SOCKET_LINK_PREFIX);
+	if (shorter_path == NULL)
+		return -EINVAL;
+
+	if (mktemp(shorter_path)[0] == '\0' || strlen(shorter_path) > sizeof_path)
+		return -EINVAL;
+	talloc_set_destructor(shorter_path, remove_socket_file);
+
+	/* Like the auxv binding in execve/exit.c: it lives on
+	 * life_context, so it's unlinked from the binding lists
+	 * before being freed, when this tracee goes away.  */
+	binding = insort_binding3(tracee, tracee->life_context, shorter_path, guest_path);
+	if (binding == NULL)
+		return -EINVAL;
+	talloc_reparent(tracee->life_context, binding, shorter_path);
+
+	strcpy(host_path, shorter_path);
+	return 0;
+}
+
+/**
  * Translate the pathname of the struct sockaddr_un currently stored
  * in the @tracee memory at the given @address.  See the documentation
  * of read_sockaddr_un() for the meaning of the @size parameter.
  * Also, the new address of the translated sockaddr_un is put in the
  * @address parameter.  A translated path too long to fit the sun_path
- * array is bound to a shorter one if @bind_long_path is true, it is
- * refused with -ENAMETOOLONG otherwise.  This function returns -errno
- * if an error occurred, 0 if there was nothing to translate,
- * otherwise 1.
+ * array is shortened, see shorten_bind_path() for bind(2) (@is_bind)
+ * and shorten_path() otherwise.  This function returns -errno if an
+ * error occurred, 0 if there was nothing to translate, otherwise 1.
  */
-int translate_socketcall_enter2(Tracee *tracee, word_t *address, int size, bool bind_long_path)
+int translate_socketcall_enter(Tracee *tracee, word_t *address, int size, bool is_bind)
 {
 	struct sockaddr_un sockaddr;
 	char user_path[PATH_MAX];
@@ -119,41 +226,11 @@ int translate_socketcall_enter2(Tracee *tracee, word_t *address, int size, bool 
 
 	/* Be careful: sun_path doesn't have to be null-terminated.  */
 	if (strlen(host_path) > sizeof_path) {
-		char *shorter_host_path;
-		Binding *binding;
-
-		if (!bind_long_path)
-			return -ENAMETOOLONG;
-
-		/* The translated path is too long to fit the sun_path
-		 * array, so let's bind it to a shorter path.  */
-		shorter_host_path = create_temp_name(tracee->ctx, "proot");
-		if (shorter_host_path == NULL || strlen(shorter_host_path) > sizeof_path)
-			return -EINVAL;
-
-		(void) mktemp(shorter_host_path);
-
-		if (strlen(shorter_host_path) > sizeof_path)
-			return -EINVAL;
-
-		/* Ensure the guest path of this new binding is
-		 * canonicalized, as it is always assumed.  */
-		strcpy(user_path, host_path);
-		status = detranslate_path(tracee, user_path, NULL);
+		status = is_bind
+			? shorten_bind_path(tracee, host_path)
+			: shorten_path(tracee, host_path);
 		if (status < 0)
-			return -EINVAL;
-
-		/* Bing the guest path to a shorter host path.  */
-		binding = insort_binding3(tracee, tracee->ctx, shorter_host_path, user_path);
-		if (binding == NULL)
-			return -EINVAL;
-
-		/* This temporary file (shorter_host_path) will be removed once the
-		 * binding is destroyed.  */
-		talloc_reparent(tracee->ctx, binding, shorter_host_path);
-
-		/* Let's use this shorter path now.  */
-		strcpy(host_path, shorter_host_path);
+			return status;
 	}
 	strncpy(sockaddr.sun_path, host_path, sizeof_path);
 
@@ -167,14 +244,6 @@ int translate_socketcall_enter2(Tracee *tracee, word_t *address, int size, bool 
 		return status;
 
 	return 1;
-}
-
-/**
- * c.f. function above, a too long path is bound to a shorter one.
- */
-int translate_socketcall_enter(Tracee *tracee, word_t *address, int size)
-{
-	return translate_socketcall_enter2(tracee, address, size, true);
 }
 
 /* A struct msghdr is seven words long, msg_name and then msg_namelen
@@ -207,8 +276,7 @@ static int translate_msg_name(Tracee *tracee, word_t address, word_t *name)
 	if (errno != 0)
 		return -errno;
 
-	/* See PR_sendto in translate_syscall_enter().  */
-	return translate_socketcall_enter2(tracee, name, namelen, false);
+	return translate_socketcall_enter(tracee, name, namelen, false);
 }
 
 /**
@@ -387,6 +455,40 @@ int translate_mmsghdr_exit(Tracee *tracee, word_t address, word_t copy, word_t c
 }
 
 /**
+ * If @path is "link/name" where link is one of the symbolic links made
+ * by translate_socketcall_enter() for a long path, replace it with
+ * the real "directory/name" so it can be detranslated.
+ */
+static void resolve_socket_link(char path[PATH_MAX])
+{
+	char target[PATH_MAX];
+	const char *temp;
+	size_t length;
+	ssize_t size;
+	char *name;
+
+	temp = get_temp_directory();
+	length = strlen(temp);
+	if (strncmp(path, temp, length) != 0
+	    || strncmp(path + length, "/" SOCKET_LINK_PREFIX "-", strlen(SOCKET_LINK_PREFIX) + 2) != 0)
+		return;
+
+	name = strchr(path + length + 1, '/');
+	if (name == NULL)
+		return;
+
+	*name = '\0';
+	size = readlink(path, target, sizeof(target) - 1);
+	*name = '/';
+	if (size < 0 || (size_t) size + strlen(name) >= sizeof(target))
+		return;
+	target[size] = '\0';
+
+	strcat(target, name);
+	strcpy(path, target);
+}
+
+/**
  * Detranslate the pathname of the struct sockaddr_un currently stored
  * in the @tracee memory at the given @sock_addr.  See the
  * documentation of read_sockaddr_un() for the meaning of the
@@ -412,6 +514,8 @@ int translate_socketcall_exit(Tracee *tracee, word_t sock_addr, word_t size_addr
 	status = read_sockaddr_un(tracee, &sockaddr, max_size, path, sock_addr, size);
 	if (status <= 0)
 		return status;
+
+	resolve_socket_link(path);
 
 	status = detranslate_path(tracee, path, NULL);
 	if (status < 0)

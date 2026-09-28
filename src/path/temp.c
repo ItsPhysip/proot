@@ -339,6 +339,42 @@ const char *create_temp_file(TALLOC_CTX *context, const char *prefix)
 }
 
 /**
+ * Create a symbolic link to @target that will be automatically
+ * removed either on PRoot termination if @context is NULL, or once
+ * its path name (attached to @context) is freed.  This function
+ * returns NULL on error, otherwise the absolute path name to the
+ * created link (@prefix-ed).
+ */
+const char *create_temp_symlink(TALLOC_CTX *context, const char *prefix, const char *target)
+{
+	char *name;
+	int i;
+
+	for (i = 0; i < 16; i++) {
+		name = create_temp_name(context, prefix);
+		if (name == NULL)
+			return NULL;
+
+		if (mktemp(name)[0] == '\0') {
+			TALLOC_FREE(name);
+			return NULL;
+		}
+
+		if (symlink(target, name) == 0) {
+			talloc_set_destructor(name, remove_temp_file);
+			return name;
+		}
+
+		TALLOC_FREE(name);
+		if (errno != EEXIST)
+			break;
+	}
+
+	note(NULL, ERROR, SYSTEM, "can't create temporary symbolic link");
+	return NULL;
+}
+
+/**
  * Like create_temp_file() but returns an open file stream to the
  * created file.  It's up to the caller to close returned stream.
  */

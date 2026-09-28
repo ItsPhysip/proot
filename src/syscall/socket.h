@@ -26,8 +26,7 @@
 #include "arch.h" /* word_t */
 #include "tracee/tracee.h"
 
-int translate_socketcall_enter(Tracee *tracee, word_t *sock_addr, int size);
-int translate_socketcall_enter2(Tracee *tracee, word_t *sock_addr, int size, bool bind_long_path);
+int translate_socketcall_enter(Tracee *tracee, word_t *sock_addr, int size, bool is_bind);
 int translate_msghdr_enter(Tracee *tracee, word_t *msghdr_addr);
 int translate_mmsghdr_enter(Tracee *tracee, word_t *vector_addr, word_t *vlen);
 int translate_mmsghdr_exit(Tracee *tracee, word_t vector_addr, word_t copy_addr, word_t count);

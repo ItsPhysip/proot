@@ -18,6 +18,7 @@ linked where they exist.
 | 2026-09-28 | syscall: translate AF_UNIX pathname destinations of sendto, sendmsg (msghdr copied, never written in place) and sendmmsg; they reached the kernel untranslated (host objects reachable, guest paths ENOENT) | `src/syscall/socket.{c,h}`, `src/syscall/enter.c`, `src/syscall/seccomp.c` | ULS |
 | 2026-09-28 | fake_id0: chroot() replaced the name-space by freeing tracee->fs while its binding lists' destructor still needed it, aborting proot ("binding.c:438: Type mismatch"); the bindings are now replaced in place, and checked against the guest path | `src/extension/fake_id0/chroot.c`, `tests/test-897815a0.sh` | ULS |
 | 2026-09-28 | sysnum: `translate_sysnum()` read one entry past the syscall table (`>` instead of `>=`) | `src/syscall/sysnum.c` | ULS |
+| 2026-09-28 | socket: a translated AF_UNIX path too long for sun_path was bound to a temporary name through a Binding allocated on tracee->ctx but never unlinked from the binding lists (use-after-free; connect() then got ENOENT and the socket lived in the temp dir). connect/sendto/sendmsg now reach the socket through a short temporary symlink removed after the syscall; bind uses a symlink to the parent directory so the socket is created at its real path (getsockname/getpeername resolve it back), and only falls back to a binding, on life_context, when even that is too long | `src/syscall/socket.{c,h}`, `src/syscall/enter.c`, `src/path/temp.{c,h}` | ULS |
 
 Base: termux/proot `d4d2a19`.
 
