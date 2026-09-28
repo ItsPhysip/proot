@@ -442,3 +442,64 @@ int translate_socketcall_exit(Tracee *tracee, word_t sock_addr, word_t size_addr
 
 	return 0;
 }
+
+/**
+ * Detranslate the source address the kernel wrote at @sock_addr (its
+ * length at @size_addr) at the exit stage of a successful recvfrom(2)
+ * or recvmsg(2): a named AF_UNIX sender is reported with its host
+ * path, which is turned back into the guest path.  At most @max_size
+ * bytes, the length the tracee allowed, are written, and the full
+ * length is reported at @size_addr even when the address had to be
+ * truncated, like the kernel does.  Abstract and unnamed addresses,
+ * and other families, are left untouched.  An address the kernel
+ * already truncated is left untouched too: its host path is lost.
+ * This function returns -errno if an error occurred, otherwise 0.
+ */
+int translate_recv_name_exit(Tracee *tracee, word_t sock_addr, word_t size_addr, word_t max_size)
+{
+	struct sockaddr_un sockaddr;
+	char path[PATH_MAX];
+	size_t length;
+	word_t full_size;
+	int status;
+	int size;
+
+	if (sock_addr == 0 || size_addr == 0)
+		return 0;
+
+	size = peek_int32(tracee, size_addr);
+	if (errno != 0)
+		return -errno;
+
+	status = read_sockaddr_un(tracee, &sockaddr, MIN(max_size, sizeof(sockaddr)),
+				path, sock_addr, size);
+	if (status <= 0)
+		return status;
+
+	status = detranslate_path(tracee, path, NULL);
+	if (status < 0)
+		return status;
+
+	/* Like the kernel: the path and its terminating null byte,
+	 * the latter omitted when the path fills sun_path.  */
+	length = strlen(path);
+	if (length > sizeof_path)
+		length = sizeof_path;
+	full_size = offsetof_path + MIN(length + 1, sizeof_path);
+
+	memset(sockaddr.sun_path, 0, sizeof_path);
+	memcpy(sockaddr.sun_path, path, length);
+
+	/* Writing at least what the kernel wrote also clears the rest of
+	 * a host path longer than the guest one.  */
+	status = write_data(tracee, sock_addr, &sockaddr,
+			    MIN(MAX(full_size, (word_t) size), max_size));
+	if (status < 0)
+		return status;
+
+	poke_int32(tracee, size_addr, full_size);
+	if (errno != 0)
+		return -errno;
+
+	return 0;
+}

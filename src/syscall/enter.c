@@ -1642,6 +1642,40 @@ static void note_netns_netlink_request(Tracee *tracee, int fd,
 }
 
 /**
+ * Remember where the recvfrom(2) / recvmsg(2) about to run writes the
+ * sender's address (@addr) and its length (@size_addr), and the length
+ * the tracee allows, then ask for the exit stage: a named AF_UNIX
+ * sender is reported with its host path, which translate_recv_name_exit()
+ * turns back into the guest path.
+ */
+static void note_recv_name(Tracee *tracee, word_t addr, word_t size_addr)
+{
+	int size;
+
+	tracee->recv_name.pending = false;
+
+	if (addr == 0 || size_addr == 0)
+		return;
+
+	size = peek_int32(tracee, size_addr);
+	if (errno != 0) {
+		/* Let the kernel report the fault.  */
+		errno = 0;
+		return;
+	}
+	if (size <= 0)
+		return;
+
+	tracee->recv_name.pending   = true;
+	tracee->recv_name.addr      = addr;
+	tracee->recv_name.size_addr = size_addr;
+	tracee->recv_name.max_size  = (word_t) size;
+
+	tracee->sysexit_pending = true;
+	tracee->restart_how = PTRACE_SYSCALL;
+}
+
+/**
  * Ask for the exit stage of the recvfrom(2) / recvmsg(2) about to run
  * on @fd when it is the one that reads the reply noted above; the
  * syscall itself is left alone, only its result is inspected.
@@ -2209,6 +2243,9 @@ int translate_syscall_enter(Tracee *tracee)
 		int fd = peek_reg(tracee, CURRENT, SYSARG_1);
 		struct fake_netlink_socket *sock = fake_netlink_socket(tracee, fd);
 
+		/* Never detranslate a stale address, see note_recv_name.  */
+		tracee->recv_name.pending = false;
+
 		if (sock != NULL) {
 			word_t buf       = peek_reg(tracee, CURRENT, SYSARG_2);
 			word_t len       = peek_reg(tracee, CURRENT, SYSARG_3);
@@ -2259,6 +2296,8 @@ int translate_syscall_enter(Tracee *tracee)
 			status = 0;
 			break;
 		}
+		note_recv_name(tracee, peek_reg(tracee, CURRENT, SYSARG_5),
+			       peek_reg(tracee, CURRENT, SYSARG_6));
 		note_netns_netlink_reply(tracee, fd);
 		status = 0;
 		break;
@@ -2267,6 +2306,9 @@ int translate_syscall_enter(Tracee *tracee)
 	case PR_recvmsg: {
 		int fd = peek_reg(tracee, CURRENT, SYSARG_1);
 		struct fake_netlink_socket *sock = fake_netlink_socket(tracee, fd);
+
+		/* Never detranslate a stale address, see note_recv_name.  */
+		tracee->recv_name.pending = false;
 
 		if (sock != NULL) {
 			word_t msghdr_addr = peek_reg(tracee, CURRENT, SYSARG_2);
@@ -2344,6 +2386,22 @@ int translate_syscall_enter(Tracee *tracee)
 			status = 0;
 			break;
 		}
+		{
+			/* msg_name, then msg_namelen: one word further in
+			 * struct msghdr, whatever the ABI.  */
+			word_t msghdr_addr = peek_reg(tracee, CURRENT, SYSARG_2);
+			word_t msg_name = 0;
+
+			if (msghdr_addr != 0) {
+				msg_name = peek_word(tracee, msghdr_addr);
+				if (errno != 0) {
+					errno = 0;
+					msg_name = 0;
+				}
+			}
+			note_recv_name(tracee, msg_name,
+				       msghdr_addr + sizeof_word(tracee));
+		}
 		note_netns_netlink_reply(tracee, fd);
 		status = 0;
 		break;
@@ -2386,6 +2444,32 @@ int translate_syscall_enter(Tracee *tracee)
 			poke_reg(tracee, SYSARG_6, size);
 			status = 0;
 			break;
+
+		case SYS_RECVFROM:
+			/* See case PR_recvfrom.  */
+			sock_addr = PEEK_WORD(SYSARG_ADDR(5), 0);
+			size_addr = PEEK_WORD(SYSARG_ADDR(6), 0);
+			note_recv_name(tracee, sock_addr, size_addr);
+			status = 0;
+			break;
+
+		case SYS_RECVMSG: {
+			/* See case PR_recvmsg.  */
+			word_t msghdr_addr = PEEK_WORD(SYSARG_ADDR(2), 0);
+			word_t msg_name = 0;
+
+			if (msghdr_addr != 0) {
+				msg_name = peek_word(tracee, msghdr_addr);
+				if (errno != 0) {
+					errno = 0;
+					msg_name = 0;
+				}
+			}
+			note_recv_name(tracee, msg_name,
+				       msghdr_addr + sizeof_word(tracee));
+			status = 0;
+			break;
+		}
 
 		default:
 			status = 0;
